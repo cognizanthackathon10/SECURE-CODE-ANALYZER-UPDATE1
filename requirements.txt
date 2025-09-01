@@ -1,0 +1,3 @@
+# No external dependencies required.
+colorama
+jinja2
