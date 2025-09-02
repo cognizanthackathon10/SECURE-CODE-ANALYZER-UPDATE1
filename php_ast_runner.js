@@ -1,68 +1,110 @@
 // php_ast_runner.js
-// Parses PHP code and applies AST rules with taint/context-aware detection.
+// PHP AST runner with support for AST, Context-Aware AST, and Taint Analysis.
 
 const parser = require("php-parser");
-const fs = require("fs");
 
 const engine = new parser.Engine({
-  parser: { extractDoc: true },
-  ast: { withPositions: true }
+  parser: { extractDoc: true, php7: true },
+  ast: { withPositions: true, withLocations: true }
 });
 
 let input = "";
-process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("data", chunk => (input += chunk));
 process.stdin.on("end", () => {
   try {
-    const payload = JSON.parse(input);
-    const code = payload.code;
+    const payload = JSON.parse(input.trim());
+    const code = payload.code || "";
     const rules = payload.rules || [];
-    const ast = engine.parseCode(code);
+
+    let ast;
+    try {
+      ast = engine.parseCode(code);
+    } catch (parseErr) {
+      process.stdout.write(JSON.stringify({ error: "PHP parse error: " + parseErr.message }));
+      return;
+    }
 
     let findings = {};
+    let taintedVars = new Set();
+
+    function markFinding(rule, node) {
+      findings[rule.id] = findings[rule.id] || [];
+      findings[rule.id].push(node.loc?.start?.line || 0);
+    }
+
+    function getVarName(node) {
+      if (!node) return null;
+      if (node.kind === "variable") return node.name;
+      if (node.kind === "offsetlookup" && node.what) return getVarName(node.what);
+      return null;
+    }
 
     function walk(node) {
       if (!node || typeof node !== "object") return;
 
       for (const rule of rules) {
-        if (node.kind === rule.nodeType) {
-          let matched = false;
+        // --- Taint AST ---
+        if (rule.type === "taint-ast") {
+          if (node.kind === "assign") {
+            const lhs = getVarName(node.left);
+            const rhsDump = JSON.stringify(node.right);
 
-          // Function calls
+            if (rule.sources.some(src => rhsDump.includes(src))) {
+              taintedVars.add(lhs);
+            }
+
+            const rhsVar = getVarName(node.right);
+            if (rhsVar && taintedVars.has(rhsVar)) {
+              taintedVars.add(lhs);
+            }
+          }
+
           if (node.kind === "call" && node.what && node.what.name) {
-            const fn = node.what.name.toLowerCase();
-            if (rule.calleeName && fn === rule.calleeName.toLowerCase()) {
+            const fn = (node.what.name || "").toLowerCase();
+            if (rule.sinks.map(s => s.toLowerCase()).includes(fn)) {
+              if (node.arguments && node.arguments.length > 0) {
+                node.arguments.forEach(arg => {
+                  const argVar = getVarName(arg);
+                  if (argVar && taintedVars.has(argVar)) {
+                    markFinding(rule, node);
+                  }
+                  const argDump = JSON.stringify(arg);
+                  if (rule.sources.some(src => argDump.includes(src))) {
+                    markFinding(rule, node);
+                  }
+                });
+              }
+            }
+          }
+
+          if (["include", "includeonce", "require", "requireonce"].includes(node.kind)) {
+            const argDump = JSON.stringify(node.target);
+            if (rule.sources.some(src => argDump.includes(src))) {
+              markFinding(rule, node);
+            }
+          }
+        }
+
+        // --- AST / Context ---
+        if (rule.type === "ast" || rule.type === "context-ast") {
+          if (node.kind === rule.nodeType) {
+            let matched = false;
+
+            if (node.kind === "call" && node.what && node.what.name) {
+              const fn = (node.what.name || "").toLowerCase();
+              if (rule.calleeName && fn === rule.calleeName.toLowerCase()) {
+                matched = true;
+              }
+            }
+
+            if (
+              ["include", "includeonce", "require", "requireonce"].includes(node.kind) &&
+              rule.nodeType === "include"
+            ) {
               matched = true;
-
-              // Taint analysis
-              if (rule.sources && node.arguments.length > 0) {
-                const argDump = JSON.stringify(node.arguments);
-                if (rule.sources.some(src => argDump.includes(src))) {
-                  matched = true;
-                }
-              }
-
-              // Pattern check (preg_replace /e)
-              if (rule.patternCheck && node.arguments.length > 0) {
-                const argDump = JSON.stringify(node.arguments[0]);
-                if (argDump.includes(rule.patternCheck)) matched = true;
-              }
             }
-          }
 
-          // Include/require
-          if (["include", "includeonce", "require", "requireonce"].includes(node.kind) && rule.nodeType === "include") {
-            matched = true;
-            if (rule.sources && node.target) {
-              const argDump = JSON.stringify(node.target);
-              if (!rule.sources.some(src => argDump.includes(src))) {
-                matched = false;
-              }
-            }
-          }
-
-          if (matched) {
-            findings[rule.id] = findings[rule.id] || [];
-            findings[rule.id].push(node.loc.start.line);
+            if (matched) markFinding(rule, node);
           }
         }
       }
@@ -75,7 +117,6 @@ process.stdin.on("end", () => {
     }
 
     walk(ast);
-
     process.stdout.write(JSON.stringify(findings));
   } catch (err) {
     process.stdout.write(JSON.stringify({ error: err.message }));

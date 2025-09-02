@@ -57,6 +57,7 @@ def dedup_text(text):
 def generate_html_report(issues, out_path):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    # --- Deduplicate issues ---
     unique_keys = set()
     deduped_issues = []
     for i in issues:
@@ -71,12 +72,52 @@ def generate_html_report(issues, out_path):
             unique_keys.add(key)
             deduped_issues.append(i)
 
-    owasp_tags = sorted({i.get("owasp", "") for i in deduped_issues if i.get("owasp")})
-    cwe_tags = sorted({i.get("cwe", "") for i in deduped_issues if i.get("cwe")})
+    # --- OWASP normalization & dedup ---
+    owasp_tags = set()
+    for i in deduped_issues:
+        tags = i.get("owasp", "").split(",")
+        for t in tags:
+            if t.strip():
+                t = t.strip().replace(" ", "").replace("–", "-").replace("—", "-")
+                m = re.match(r"A(\d+):?(\d{4})?-?(.*)", t, flags=re.I)
+                if m:
+                    num, year, rest = m.groups()
+                    num = num.zfill(2)
+                    year = year if year else "2021"
+                    rest = (rest or "").lstrip("-")
+                    norm = f"A{num}:{year}"
+                    if rest:
+                        norm += f"-{rest}"
+                    owasp_tags.add(norm)
+                else:
+                    owasp_tags.add(t)
 
-    json_content = json.dumps(deduped_issues, indent=2)
-    json_content_js = json_content.replace("\\", "\\\\").replace("`", "\\`")
+    def sort_owasp(tag):
+        m = re.match(r"A(\d+):(\d{4})(?:-(.*))?", tag)
+        if m:
+            num, year, rest = m.groups()
+            return (int(num), year, rest or "")
+        return (999, "9999", tag)
 
+    owasp_sorted = sorted(owasp_tags, key=sort_owasp)
+    owasp_opts = "".join([f"<option value='{t}'>{t}</option>" for t in owasp_sorted])
+
+    # --- CWE normalization & dedup ---
+    cwe_tags = set()
+    for i in deduped_issues:
+        tags = i.get("cwe", "").split(",")
+        for t in tags:
+            if t.strip():
+                t = t.strip().upper()
+                m = re.match(r"CWE-?(\d+)", t)
+                if m:
+                    cwe_tags.add(f"CWE-{int(m.group(1))}")
+                else:
+                    cwe_tags.add(t)
+
+    cwe_opts = "".join([f"<option value='{t}'>{t}</option>" for t in sorted(cwe_tags)])
+
+    # --- Render issues into rows ---
     rows = []
     for i in deduped_issues:
         sev = escape(i.get("severity", ""))
@@ -93,9 +134,14 @@ def generate_html_report(issues, out_path):
 
         extra_tags = []
         if owasp:
-            extra_tags.append(f"<span class='tag owasp'>{owasp}</span>")
+            for tag in sorted(set(owasp.split(","))):
+                if tag.strip():
+                    extra_tags.append(f"<span class='tag owasp'>{escape(tag)}</span>")
         if cwe:
-            extra_tags.append(f"<span class='tag cwe'>{cwe}</span>")
+            for tag in sorted(set(cwe.split(","))):
+                if tag.strip():
+                    extra_tags.append(f"<span class='tag cwe'>{escape(tag)}</span>")
+
         rule_cell = rule_id
         if extra_tags:
             rule_cell += "<br>" + " ".join(extra_tags)
@@ -114,9 +160,10 @@ def generate_html_report(issues, out_path):
           </tr>
         """)
 
-    owasp_opts = "".join([f"<option value='{t}'>{t}</option>" for t in owasp_tags])
-    cwe_opts = "".join([f"<option value='{t}'>{t}</option>" for t in cwe_tags])
+    json_content = json.dumps(deduped_issues, indent=2)
+    json_content_js = json_content.replace("\\", "\\\\").replace("`", "\\`")
 
+    # --- Final HTML ---
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>

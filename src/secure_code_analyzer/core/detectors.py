@@ -7,7 +7,7 @@ import subprocess
 # Load rules from rules.json
 # ========================
 RULES_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),  # go up from /core
+    os.path.dirname(os.path.dirname(__file__)),
     "rules",
     "rules.json"
 )
@@ -28,16 +28,10 @@ PHP_AST_RUNNER = os.path.join(PROJECT_ROOT, "php_ast_runner.js")
 print("JS_AST_RUNNER:", JS_AST_RUNNER)
 print("PHP_AST_RUNNER:", PHP_AST_RUNNER)
 
-
 # ========================
 # AST Runner Helper
 # ========================
 def run_node_ast_runner(runner, code, ast_rules):
-    """
-    Run Node.js AST helper once and return parsed matches.
-    We now also pass the AST rules so the runner knows about
-    taint-aware / context-aware detection.
-    """
     try:
         proc = subprocess.run(
             ["node", runner],
@@ -51,6 +45,48 @@ def run_node_ast_runner(runner, code, ast_rules):
     except Exception as e:
         return {"error": str(e)}
 
+# ========================
+# Normalization Helpers
+# ========================
+def normalize_owasp(tag_str):
+    tags = [t.strip() for t in tag_str.split(",") if t.strip()]
+    norm_tags = set()
+    for t in tags:
+        t = t.replace(" ", "").replace("–", "-").replace("—", "-")
+        if ":" in t:
+            m = re.match(r"A(\d+):?(\d{4})?-?(.*)", t, flags=re.I)
+            if m:
+                num, year, rest = m.groups()
+                num = num.zfill(2)
+                year = year if year else "2021"
+                rest = rest if rest else ""
+                rest = rest.lstrip("-")
+                norm = f"A{num}:{year}"
+                if rest:
+                    norm += f"-{rest}"
+                norm_tags.add(norm)
+            else:
+                norm_tags.add(t)
+        else:
+            norm_tags.add(t)
+    return norm_tags
+
+def normalize_cwe(tag_str):
+    tags = [t.strip().upper() for t in tag_str.split(",") if t.strip()]
+    norm_tags = set()
+    for t in tags:
+        if t.startswith("CWE"):
+            m = re.match(r"CWE-?(\d+)", t)
+            if m:
+                norm_tags.add(f"CWE-{int(m.group(1))}")
+            else:
+                norm_tags.add(t)
+        else:
+            norm_tags.add(t)
+    return norm_tags
+
+def normalize_category(cat):
+    return cat.strip().title() if cat else cat
 
 # ========================
 # Rule-based detector
@@ -58,112 +94,71 @@ def run_node_ast_runner(runner, code, ast_rules):
 def run_detectors(code, file_path):
     issues = []
 
-    # Detect language by file extension
     lang = "javascript" if file_path.endswith(".js") else "php" if file_path.endswith(".php") else None
     if not lang:
         return issues
 
-    # Separate regex, AST, and Context-AST rules
-    regex_rules      = [r for r in RULES if r["language"] == lang and r["type"] == "regex"]
-    ast_rules        = [r for r in RULES if r["language"] == lang and r["type"] == "ast"]
+    regex_rules       = [r for r in RULES if r["language"] == lang and r["type"] == "regex"]
+    heuristic_rules   = [r for r in RULES if r["language"] == lang and r["type"] == "heuristic"]
+    ast_rules         = [r for r in RULES if r["language"] == lang and r["type"] == "ast"]
     context_ast_rules = [r for r in RULES if r["language"] == lang and r["type"] == "context-ast"]
+    taint_ast_rules   = [r for r in RULES if r["language"] == lang and r["type"] == "taint-ast"]
 
+    def make_issue(rule, line_no, snippet, detected_by):
+        return {
+            "id": rule["id"],
+            "file": file_path,
+            "line": line_no,
+            "severity": rule["severity"].upper(),
+            "category": normalize_category(rule["category"]),
+            "message": rule["message"],
+            "suggestion": rule["suggestion"],
+            "owasp": ",".join(sorted(normalize_owasp(rule.get("owasp", "")))),
+            "cwe": ",".join(sorted(normalize_cwe(rule.get("cwe", "")))),
+            "snippet": snippet,
+            "detected_by": detected_by
+        }
 
-    # --- Regex rules ---
+    # --- Regex ---
     for rule in regex_rules:
         for match in re.finditer(rule["pattern"], code, flags=re.IGNORECASE):
             line_no = code[:match.start()].count("\n") + 1
-            issues.append({
-                "id": rule["id"],
-                "file": file_path,
-                "line": line_no,
-                "severity": rule["severity"].upper(),
-                "category": rule["category"],
-                "message": rule["message"],
-                "suggestion": rule["suggestion"],
-                "owasp": rule.get("owasp", ""),
-                "cwe": rule.get("cwe", ""),
-                "snippet": code.splitlines()[line_no - 1].strip(),
-                "detected_by": "Regex"
-            })
+            issues.append(make_issue(rule, line_no, code.splitlines()[line_no - 1].strip(), "Regex"))
 
-    # --- AST rules ---
+    # --- Heuristic ---
+    for rule in heuristic_rules:
+        for match in re.finditer(rule["pattern"], code, flags=re.IGNORECASE):
+            line_no = code[:match.start()].count("\n") + 1
+            issues.append(make_issue(rule, line_no, code.splitlines()[line_no - 1].strip(), "Heuristic"))
+
+    # --- AST ---
     if ast_rules:
         runner = JS_AST_RUNNER if lang == "javascript" else PHP_AST_RUNNER
         result = run_node_ast_runner(runner, code, ast_rules)
-
-        if "error" in result:
-            error_msg = result["error"]
-
-            # Try to extract line number from error message
-            line_no = 0
-            m = re.search(r"[Ll]ine\s+(\d+)", error_msg)
-            if m:
-                try:
-                    line_no = int(m.group(1))
-                except ValueError:
-                    line_no = 0
-
-            snippet = ""
-            if line_no > 0 and line_no <= len(code.splitlines()):
-                snippet = code.splitlines()[line_no - 1].strip()
-
-            issues.append({
-                "id": f"{lang.upper()}-AST-PARSE-ERROR",
-                "file": file_path,
-                "line": line_no,
-                "severity": "LOW",
-                "category": "Parser",
-                "message": f"{lang.upper()} AST parse error: {error_msg}",
-                "suggestion": "Check syntax or Node.js runner configuration.",
-                "owasp": "",
-                "cwe": "",
-                "snippet": snippet,
-                "detected_by": "AST"
-            })
-        else:
+        if "error" not in result:
             for rule in ast_rules:
-                matched_lines = result.get(rule["id"], [])
-                for line_no in matched_lines:
-                    issues.append({
-                        "id": rule["id"],
-                        "file": file_path,
-                        "line": line_no,
-                        "severity": rule["severity"].upper(),
-                        "category": rule["category"],
-                        "message": rule["message"],
-                        "suggestion": rule["suggestion"],
-                        "owasp": rule.get("owasp", ""),
-                        "cwe": rule.get("cwe", ""),
-                        "snippet": code.splitlines()[line_no - 1].strip() if line_no > 0 else "",
-                        "detected_by": "AST"
-                    })
+                for line_no in result.get(rule["id"], []):
+                    issues.append(make_issue(rule, line_no, code.splitlines()[line_no - 1].strip(), "AST"))
 
-    # --- Context-AST rules ---
+    # --- Context-AST ---
     if context_ast_rules:
         runner = JS_AST_RUNNER if lang == "javascript" else PHP_AST_RUNNER
         result = run_node_ast_runner(runner, code, context_ast_rules)
-        
         if "error" not in result:
             for rule in context_ast_rules:
-                matched_lines = result.get(rule["id"], [])
-                for line_no in matched_lines:
-                    issues.append({
-                        "id": rule["id"],
-                        "file": file_path,
-                        "line": line_no,
-                        "severity": rule["severity"].upper(),
-                        "category": rule["category"],
-                        "message": rule["message"],
-                        "suggestion": rule["suggestion"],
-                        "owasp": rule.get("owasp", ""),
-                        "cwe": rule.get("cwe", ""),
-                        "snippet": code.splitlines()[line_no - 1].strip() if line_no > 0 else "",
-                        "detected_by": "Context-AST"
-                    })
-                
+                for line_no in result.get(rule["id"], []):
+                    issues.append(make_issue(rule, line_no, code.splitlines()[line_no - 1].strip(), "Context-AST"))
 
-    # --- Deduplication + Merge ---
+    # --- Taint-AST ---
+    if taint_ast_rules:
+        runner = JS_AST_RUNNER if lang == "javascript" else PHP_AST_RUNNER
+        result = run_node_ast_runner(runner, code, taint_ast_rules)
+        if "error" not in result:
+            for rule in taint_ast_rules:
+                for line_no in result.get(rule["id"], []):
+                    issues.append(make_issue(rule, line_no, code.splitlines()[line_no - 1].strip(), "AST(Taint)"))
+
+    # --- Deduplication & Priority ---
     deduped = {}
     sev_order = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
@@ -174,43 +169,39 @@ def run_detectors(code, file_path):
         if not existing:
             deduped[key] = issue
         else:
-            # pick higher severity
             if sev_order[issue["severity"]] > sev_order[existing["severity"]]:
                 merged = issue
             else:
                 merged = existing
 
-            # merge messages/suggestions
-            merged["message"] = f"{existing['message']} | {issue['message']}"
-            merged["suggestion"] = f"{existing['suggestion']} | {issue['suggestion']}"
+            # Merge OWASP & CWE
+            merged["owasp"] = ",".join(sorted(normalize_owasp(existing.get("owasp", "")) |
+                                              normalize_owasp(issue.get("owasp", ""))))
+            merged["cwe"]   = ",".join(sorted(normalize_cwe(existing.get("cwe", "")) |
+                                              normalize_cwe(issue.get("cwe", ""))))
 
-            # merge detectors with Context-AST priority
+            # Priority for detector type
             detected_set = set(existing["detected_by"].split("+")) | set(issue["detected_by"].split("+"))
             if "Context-AST" in detected_set:
                 merged["detected_by"] = "Context-AST"
+            elif "AST" in detected_set:
+                merged["detected_by"] = "AST"
+            elif "Heuristic" in detected_set:
+                merged["detected_by"] = "Heuristic"
             else:
-                merged["detected_by"] = "+".join(sorted(detected_set))
+                merged["detected_by"] = "Regex"
 
-            # merge OWASP tags
-            owasp_set = set(filter(None, existing.get("owasp", "").split(","))) | \
-                        set(filter(None, issue.get("owasp", "").split(",")))
-            merged["owasp"] = ",".join(sorted(owasp_set))
-
-            # merge CWE tags
-            cwe_set = set(filter(None, existing.get("cwe", "").split(","))) | \
-                      set(filter(None, issue.get("cwe", "").split(",")))
-            merged["cwe"] = ",".join(sorted(cwe_set))
+            if "AST(Taint)" in detected_set and "AST(Taint)" not in merged["detected_by"]:
+                merged["detected_by"] += "+AST(Taint)"
 
             deduped[key] = merged
 
     return list(deduped.values())
 
-
 # ========================
-# Main detector entry
+# Main
 # ========================
 def detect_issues(file_path):
-    """Read file and run rule-based detectors."""
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             code = f.read()
@@ -228,5 +219,4 @@ def detect_issues(file_path):
             "cwe": "",
             "snippet": ""
         }]
-
     return run_detectors(code, file_path)

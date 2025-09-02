@@ -3,6 +3,7 @@ import os
 import sys
 
 from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 from secure_code_analyzer.core.scanner import scan_file
 from secure_code_analyzer.core.reporters import (
     generate_json_report,
@@ -87,6 +88,7 @@ def cli_mode(args):
 def serve_mode():
     """Run Flask server for frontend integration."""
     app = Flask(__name__)
+    CORS(app)
 
     @app.route("/scan", methods=["POST"])
     def scan_endpoint():
@@ -142,8 +144,9 @@ def serve_mode():
 
         return jsonify({"issues": issues, "count": len(issues)})
 
-    print("🚀 Secure Code Analyzer server running at http://localhost:5000")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    print(f"🚀 Secure Code Analyzer server running at http://0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
 
 
 def main():
